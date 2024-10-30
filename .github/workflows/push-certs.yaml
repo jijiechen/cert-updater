@@ -1,0 +1,227 @@
+
+name: push certs
+on:
+  schedule:
+      # run 20:00 UTC every day (Beijing time: 4:00 am)
+    - cron: 0 20 * * *
+  workflow_dispatch: 
+    inputs:
+      domain_name:
+        description: The domain name to push updates, set empty to push all configured.
+        required: false
+        default: ''
+        type: string
+jobs:
+  generate_matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.generate-matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: "${{ vars.CERTS_BRANCH || 'main' }}"
+
+      - name: Setup encryption
+        env: 
+          GIT_CRYPT_KEY: ${{ secrets.GIT_CRYPT_KEY }}
+        run: |
+          mkdir -p ./.working
+          echo -n "${GIT_CRYPT_KEY}" | base64 --decode > ./.working/git-crypt-key
+          
+          mkdir -p ./.git-crypt
+          cp ./git-crypt/git-crypt-debian-amd64 ./.git-crypt/git-crypt
+          chmod +x ./.git-crypt/git-crypt
+          
+          ./.git-crypt/git-crypt unlock ./.working/git-crypt-key
+
+      - name: Install yq
+        run: |
+          if [[ ! -f "./.yq/yq" ]]; then
+              echo "Downloading yq..."
+              (mkdir .yq && cd .yq; VERSION=v4.42.1 BINARY=yq_linux_amd64 bash -c 'curl -sL https://github.com/mikefarah/yq/releases/download/${VERSION}/${BINARY}.tar.gz -o /dev/stdout | tar xz && mv ${BINARY} ./yq')
+          fi
+
+      - name: Generate matrix
+        id: generate-matrix
+        run: |
+          ./.yq/yq -o json ./config.yml > ./.working/config.json
+          node ./pushes-detect.js ./.working/config.json > $GITHUB_OUTPUT
+
+  push_qcloud:
+    runs-on: ubuntu-latest
+    needs: [ "generate_matrix" ]
+    strategy:
+      max-parallel: 1
+      matrix: 
+        tencentcloud: ${{ fromJSON(needs.generate_matrix.outputs.matrix).tencentcloud }}
+    permissions:
+      # Give the default GITHUB_TOKEN write permission to commit and push the
+      # added or changed files to the repository.
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: "${{ vars.CERTS_BRANCH || 'main' }}"
+
+      - name: Setup encryption
+        env: 
+          GIT_CRYPT_KEY: ${{ secrets.GIT_CRYPT_KEY }}
+        run: |
+          mkdir -p ./.working
+          echo -n "${GIT_CRYPT_KEY}" | base64 --decode > ./.working/git-crypt-key
+          
+          mkdir -p ./.git-crypt
+          cp ./git-crypt/git-crypt-debian-amd64 ./.git-crypt/git-crypt
+          chmod +x ./.git-crypt/git-crypt
+          
+          ./.git-crypt/git-crypt unlock ./.working/git-crypt-key
+       
+      - name: Check if should push
+        id: check_if_push
+        run: |
+          CERT_THUMBPRINT=$(openssl x509 -in "${{ matrix.tencentcloud._cert_dir }}/cert.pem" -fingerprint -noout | cut -d '=' -f 2 | sed 's/://g')
+          PUSH_STATE_FILE=${{ matrix.tencentcloud._cert_dir }}/pushes.json
+
+          export THIS_PUSH='${{ toJSON(matrix.tencentcloud) }}'
+          export DETECT_ONLY=1
+          node ./pushes-update-state.js  $CERT_THUMBPRINT $PUSH_STATE_FILE > $GITHUB_OUTPUT
+
+       
+      # todo: read existing certID
+      # todo: try to reuse output certID
+      # https://cloud.tencent.com/document/product/400/91667
+      - name: Push to tencentcloud
+        if: steps.check_if_push.outputs.push == 'true'
+        uses: jijiechen/tencentcloud-ssl-update-action@v0.9.0
+        with:
+          secret_id: ${{ secrets.TENCENT_CLOUD_SECRET_ID }}
+          secret_key: ${{ secrets.TENCENT_CLOUD_SECRET_KEY }}
+
+          path_certificate: ${{ matrix.tencentcloud._cert_dir }}/fullchain.pem
+          path_private_key: ${{ matrix.tencentcloud._cert_dir }}/privkey.pem
+
+          cloud_service_type: ${{ matrix.tencentcloud.cloud_service_type }}
+          region: ${{ matrix.tencentcloud.region }}
+          domain: ${{ matrix.tencentcloud.domain_name }}
+
+          apigw_service_id: ${{ matrix.tencentcloud.apigw_service_id }}
+
+          clb_id: ${{ matrix.tencentcloud.clb_id }}
+          clb_port: ${{ matrix.tencentcloud.clb_port }}
+          clb_protocol: ${{ matrix.tencentcloud.clb_protocol }}
+          # todo: output certID
+       
+      - name: Add push status
+        run: |
+          unset DETECT_ONLY
+          CERT_THUMBPRINT=$(openssl x509 -in "${{ matrix.tencentcloud._cert_dir }}/cert.pem" -fingerprint -noout | cut -d '=' -f 2 | sed 's/://g')
+          PUSH_STATE_FILE=${{ matrix.tencentcloud._cert_dir }}/pushes.json
+          
+          export THIS_PUSH='${{ toJSON(matrix.tencentcloud) }}'
+          # todo: get output from previous step and write down the CertID
+          node ./pushes-update-state.js  $CERT_THUMBPRINT $PUSH_STATE_FILE
+
+      # https://github.com/stefanzweifel/git-auto-commit-action
+      # 1. Set the contents-permission of the default GITHUB_TOKEN to true. (Required to push new commits to the repository), see https://docs.github.com/en/actions/security-guides/automatic-token-authentication#modifying-the-permissions-for-the-github_token
+      # 2. Add the following step at the end of your job, after other steps that might add or change files.
+      - uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "gha: pushed cert of ${{ matrix.tencentcloud.domain_name }} to ${{ matrix.tencentcloud.cloud_service_type }} (run ${{ github.run_id }})"
+          add_options: '-A'
+          file_pattern: './certs ./staging-certs'
+      
+      - name: Cleanup
+        if: ${{ always() }}
+        run: |
+          if [[ -f "./.git-crypt/git-crypt" ]]; then
+            ./.git-crypt/git-crypt lock --force
+          fi
+          rm -rf ./.working
+
+  push_ssh:
+    runs-on: ubuntu-latest
+    needs: [ "generate_matrix", "push_qcloud" ] # after push_qcloud
+    strategy:
+      max-parallel: 1
+      matrix: 
+        ssh: ${{ fromJSON(needs.generate_matrix.outputs.matrix).ssh }}
+    permissions:
+      # Give the default GITHUB_TOKEN write permission to commit and push the
+      # added or changed files to the repository.
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: "${{ vars.CERTS_BRANCH || 'main' }}"
+
+      - name: Setup encryption
+        env: 
+          GIT_CRYPT_KEY: ${{ secrets.GIT_CRYPT_KEY }}
+        run: |
+          mkdir -p ./.working
+          echo -n "${GIT_CRYPT_KEY}" | base64 --decode > ./.working/git-crypt-key
+          
+          mkdir -p ./.git-crypt
+          cp ./git-crypt/git-crypt-debian-amd64 ./.git-crypt/git-crypt
+          chmod +x ./.git-crypt/git-crypt
+          
+          ./.git-crypt/git-crypt unlock ./.working/git-crypt-key
+       
+      - name: Check if should push
+        id: check_if_push
+        run: |
+          CERT_THUMBPRINT=$(openssl x509 -in "${{ matrix.ssh._cert_dir }}/cert.pem" -fingerprint -noout | cut -d '=' -f 2 | sed 's/://g')
+          PUSH_STATE_FILE=${{ matrix.ssh._cert_dir }}/pushes.json
+
+          export THIS_PUSH='${{ toJSON(matrix.ssh) }}'
+          export DETECT_ONLY=1
+          node ./pushes-update-state.js  $CERT_THUMBPRINT $PUSH_STATE_FILE > $GITHUB_OUTPUT
+
+      - name: Push to ${{ matrix.ssh.host }}
+        if: steps.check_if_push.outputs.push == 'true'
+        run: |
+          set -e
+
+          NOW=$(date '+%Y%m%d%H%M')
+          WORK_DIR_RANDOM=/tmp/certbot.$NOW.$RANDOM
+          USERNAME=${{ matrix.ssh.username }}
+          SSH_HOST=${{ matrix.ssh.host }}
+          SSH_PORT=${{ matrix.ssh.port }}
+          mkdir -p $WORK_DIR_RANDOM
+          cp ./ssh/ssh-updater.key ./.working/
+          chmod 0600 ./.working/ssh-updater.key
+          CERT_NAME=$(basename ${{ matrix.ssh._cert_dir }})
+          tar czf ./.working/${{ matrix.ssh.host }}-$CERT_NAME.certs.tar.gz -C ${{ matrix.ssh._cert_dir }} .
+          ssh -i ./.working/ssh-updater.key -o StrictHostKeyChecking=no -p $SSH_PORT $USERNAME@$SSH_HOST -f "rm -rf $WORK_DIR_RANDOM ; mkdir -p $WORK_DIR_RANDOM"
+          scp -i ./.working/ssh-updater.key -o StrictHostKeyChecking=no -P $SSH_PORT ./.working/${{ matrix.ssh.host }}-$CERT_NAME.certs.tar.gz $USERNAME@$SSH_HOST:$WORK_DIR_RANDOM/
+          scp -i ./.working/ssh-updater.key -o StrictHostKeyChecking=no -P $SSH_PORT ./ssh/${{ matrix.ssh.installer }}/installer.sh $USERNAME@$SSH_HOST:$WORK_DIR_RANDOM/
+          ssh -i ./.working/ssh-updater.key -o StrictHostKeyChecking=no -p $SSH_PORT -f $USERNAME@$SSH_HOST "chmod +x $WORK_DIR_RANDOM/installer.sh; $WORK_DIR_RANDOM/installer.sh ${{ matrix.ssh.installer_params || '' }}"
+       
+      - name: Add push status
+        run: |
+          unset DETECT_ONLY
+          CERT_THUMBPRINT=$(openssl x509 -in "${{ matrix.ssh._cert_dir }}/cert.pem" -fingerprint -noout | cut -d '=' -f 2 | sed 's/://g')
+          PUSH_STATE_FILE=${{ matrix.ssh._cert_dir }}/pushes.json
+          
+          export THIS_PUSH='${{ toJSON(matrix.ssh) }}'
+          node ./pushes-update-state.js  $CERT_THUMBPRINT $PUSH_STATE_FILE
+
+      # https://github.com/stefanzweifel/git-auto-commit-action
+      # 1. Set the contents-permission of the default GITHUB_TOKEN to true. (Required to push new commits to the repository), see https://docs.github.com/en/actions/security-guides/automatic-token-authentication#modifying-the-permissions-for-the-github_token
+      # 2. Add the following step at the end of your job, after other steps that might add or change files.
+      - uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "gha: updating certs (run ${{ github.run_id }})"
+          add_options: '-A'
+          file_pattern: './certs ./staging-certs'
+      
+      - name: Cleanup
+        if: ${{ always() }}
+        run: |
+          if [[ -f "./.git-crypt/git-crypt" ]]; then
+            ./.git-crypt/git-crypt lock --force
+          fi
+          rm -rf ./.working
+
+# todo: Push an email alert when a certificate cann't be updated and it's very close to expire or alreay expired (<10d)
+# todo: Generate a GitHub Action build report on which certificates updated?

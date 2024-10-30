@@ -1,0 +1,3 @@
+certs/**/privkey.pem filter=git-crypt diff=git-crypt
+staging-certs/**/privkey.pem filter=git-crypt diff=git-crypt
+ssh/*.key filter=git-crypt diff=git-crypt

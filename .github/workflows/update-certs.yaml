@@ -1,0 +1,93 @@
+
+name: update certs
+on:
+  schedule:
+      # run 18:00 UTC every day (Beijing time: 2:00 am)
+    - cron: 0 18 * * *
+  workflow_dispatch: 
+    inputs:
+      on_demond_domain:
+        description: The domain name to request certificate, set empty to skip and start a normal run.
+        required: false
+        default: ''
+        type: string
+      on_demond_domain_profile:
+        description: DNS Provider profile name
+        required: false
+        default: 'dnspod_profile'
+        type: string
+jobs:
+  update-certs:
+    runs-on: ubuntu-latest
+    permissions:
+      # Give the default GITHUB_TOKEN write permission to commit and push the
+      # added or changed files to the repository.
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: "${{ vars.CERTS_BRANCH || 'main' }}"
+
+      - name: Setup encryption
+        env: 
+          GIT_CRYPT_KEY: ${{ secrets.GIT_CRYPT_KEY }}
+        run: |
+          mkdir -p ./.working
+          echo -n "${GIT_CRYPT_KEY}" | base64 --decode > ./.working/git-crypt-key
+          
+          mkdir -p ./.git-crypt
+          cp ./git-crypt/git-crypt-debian-amd64 ./.git-crypt/git-crypt
+          chmod +x ./.git-crypt/git-crypt
+          
+          ./.git-crypt/git-crypt unlock ./.working/git-crypt-key
+
+      - name: Update config.yml for the on-demond domain
+        if: github.event.inputs.on_demond_domain != ''
+        run: |
+          if [[ ! -f "./.yq/yq" ]]; then
+              echo "Downloading yq..."
+              (mkdir .yq && cd .yq; VERSION=v4.42.1 BINARY=yq_linux_amd64 bash -c 'curl -sL https://github.com/mikefarah/yq/releases/download/${VERSION}/${BINARY}.tar.gz -o /dev/stdout | tar xz && mv ${BINARY} ./yq')
+          fi
+          ./.yq/yq -i '.certificates += [ {"domains":[ "${{ github.event.inputs.on_demond_domain }}" ], "profile": "${{ github.event.inputs.on_demond_domain_profile }}"} ]' ./config.yml
+
+      - name: Detect cert update/request requirements
+        id: detect
+        run: |
+          bash -f ./detect-requirements.sh
+          if [[ -f "./.working/dnsrobocert/config.yml" ]]; then
+            echo "certs_to_request=true" > $GITHUB_OUTPUT
+          fi
+        env:
+          DNS_PROVIDER_API_KEY: ${{ secrets.DNS_PROVIDER_API_KEY }}
+          DNS_PROVIDER_API_KEY: ${{ secrets.DNS_PROVIDER_API_KEY }}
+
+      - name: Install python components for dnsrobocert
+        if: steps.detect.outputs.certs_to_request != ''
+        run: |
+          bash -f ./prepare-pyenv.sh
+
+      - name: Request certs from Let's Encrypt
+        if: steps.detect.outputs.certs_to_request != ''
+        run: |
+          bash -f ./update-certs.sh
+
+      # https://github.com/stefanzweifel/git-auto-commit-action
+      # 1. Set the contents-permission of the default GITHUB_TOKEN to true. (Required to push new commits to the repository), see https://docs.github.com/en/actions/security-guides/automatic-token-authentication#modifying-the-permissions-for-the-github_token
+      # 2. Add the following step at the end of your job, after other steps that might add or change files.
+      - uses: stefanzweifel/git-auto-commit-action@v5
+        if: steps.detect.outputs.certs_to_request != ''
+        with:
+          commit_message: "gha: updating certs (run ${{ github.run_id }})"
+          add_options: '-A'
+          file_pattern: './certs ./staging-certs'
+      
+      - name: Cleanup
+        if: ${{ always() }}
+        run: |
+          if [[ -f "./.git-crypt/git-crypt" ]]; then
+            ./.git-crypt/git-crypt lock --force
+          fi
+          rm -rf ./.working
+
+# todo: Push an email alert when a certificate cann't be updated and it's very close to expire or alreay expired (<10d)
+# todo: Generate a GitHub Action build report on which certificates updated?

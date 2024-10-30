@@ -1,0 +1,39 @@
+draft: false
+acme:
+  email_account: user@example.com
+  staging: false
+profiles:
+- name: example_dns_profile
+  provider: dns_provider_name
+  # https://dns-lexicon.readthedocs.io/en/latest/providers_options.html
+  provider_options:
+    auth_username: "DNS_PROVIDER_API_KEY"
+    auth_token: "DNS_PROVIDER_API_TOKEN"
+certificates:
+# when there are multiple domains under this item, they will be placed in the same certificate
+- domains:
+  # we only apply for wildcard certificates
+  # so www.my-domain.com equals *.www.my-domain.com
+  - www.my-domain.com
+  profile: example_dns_profile
+  pushes:
+  - tencentcloud: 
+      cloud_service_type: cdn
+      domain_name: www.my-domain.com
+  - ssh: 
+      username: ubuntu
+      host: 1.2.3.4
+      port: 22
+      installer: kube
+      installer_params: "my-ns server-certs my-app-name"
+- domains:
+  - "my-domain.com"
+  profile: example_dns_profile
+  # pushes:
+  # - tencentcloud: 
+  #     cloud_service_type: apigateway
+  #     domain_name: images.my-domain.com
+  #     region: ap-shanghai
+  #     apigw_service_id: service-esw32wp
+
+
